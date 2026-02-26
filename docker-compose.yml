@@ -1,0 +1,71 @@
+version: '3.8'
+
+services:
+  # ---------------------------------------------
+  # 1. 消息中间件 (Redis)
+  # ---------------------------------------------
+  redis:
+    image: redis:alpine
+    container_name: doc-parser-redis
+    ports:
+      - "6379:6379"
+
+  # ---------------------------------------------
+  # 2. 后端 API 服务 (只负责接收请求)
+  # ---------------------------------------------
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: doc-parser-api
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./data.db:/app/data.db       # 挂载数据库
+      - ./uploads:/app/uploads       # ⚠️ 关键：挂载共享上传目录
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+      - LM_STUDIO_API_BASE=http://host.docker.internal:1234/v1
+    depends_on:
+      - redis
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  # ---------------------------------------------
+  # 3. 后台 Worker 服务 (负责 OCR + LLM)
+  # ---------------------------------------------
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile  # 复用同一个镜像环境
+    container_name: doc-parser-worker
+    # 启动命令：启动 Celery Worker，并发数设为 2 (根据你的 CPU 核数调整)
+    command: celery -A src.worker.celery_app worker --loglevel=info --concurrency=2
+    volumes:
+      - ./data.db:/app/data.db       # 必须挂载同一个数据库
+      - ./uploads:/app/uploads       # 必须挂载同一个上传目录
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+      - LM_STUDIO_API_BASE=http://host.docker.internal:1234/v1
+#      - WEBHOOK_URL=https://webhook.site/你的临时地址    //⚠️ 如果需要，可以配置 Webhook 地址
+    depends_on:
+      - redis
+      - api # 等 API 起来后再起 worker，避免数据库锁问题
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  # ---------------------------------------------
+  # 4. 前端 Dashboard
+  # ---------------------------------------------
+  dashboard:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: doc-parser-dashboard
+    ports:
+      - "8501:8501"
+    environment:
+      - API_URL=http://api:8000
+    command: ["streamlit", "run", "src/dashboard.py", "--server.address=0.0.0.0"]
+    depends_on:
+      - api
