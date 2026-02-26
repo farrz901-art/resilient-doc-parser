@@ -22,20 +22,6 @@
 
 
 
-
-
-![image-20260226191245294](C:\Users\LENOVO\AppData\Roaming\Typora\typora-user-images\image-20260226191245294.png)
-
-
-
-
-
-## 🏗️ 架构设计 (Architecture)
-
-![deepseek_mermaid_20260226_54cf12](D:\LianxiangDownload\deepseek_mermaid_20260226_54cf12.png)
-
-
-
 ## 🚀 快速开始 (Quick Start)
 
 ### 前置要求
