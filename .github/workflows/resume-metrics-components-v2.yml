@@ -1,0 +1,116 @@
+name: Resume Metrics Components V2
+
+on:
+  push:
+    branches:
+      - resume-metrics-ci
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  component-metrics:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    services:
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Compile source
+        run: python -m compileall -q src
+      - name: Run component checks
+        env:
+          REDIS_URL: redis://localhost:6379/0
+        run: |
+          python <<'PY'
+          import io, json, os, re, time
+          from pathlib import Path
+          import fitz, docx, redis
+          from PIL import Image, ImageDraw, ImageFont
+          from pydantic import ValidationError
+          from src.core.ingest import parse_file
+          from src.core.models import BaseExtractionResult
+          from src.parsers.invoice import Invoice, LineItem
+          import src.router as router
+
+          m={'checks':[],'latencyMs':{}}
+          def ck(name, cond, detail=None):
+              m['checks'].append({'name':name,'passed':bool(cond),'detail':detail})
+              if not cond: raise AssertionError(f'{name}: {detail}')
+          class U:
+              def __init__(self,n,b): self.filename=n; self.file=io.BytesIO(b)
+          def run(label,n,b):
+              t=time.perf_counter(); out=parse_file(U(n,b)); m['latencyMs'][label]=round((time.perf_counter()-t)*1000,3); return out
+
+          out=run('txt','a.txt',b'plain text invoice 12345 total 99.50'); ck('txt ingestion','invoice 12345' in out.lower(),out[:100])
+          out=run('markdown','a.md',b'# Contract\nParty A: Alpha\nParty B: Beta'); ck('markdown ingestion','Party A' in out,out[:100])
+          d=docx.Document(); d.add_paragraph('DOCX CONTRACT PARTY A ALPHA PARTY B BETA'); b=io.BytesIO(); d.save(b)
+          out=run('docx','a.docx',b.getvalue()); ck('docx ingestion','DOCX CONTRACT' in out,out[:100])
+
+          img=Image.new('RGB',(1800,700),'white'); draw=ImageDraw.Draw(img); fp='/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf'
+          font=ImageFont.truetype(fp,72) if Path(fp).exists() else ImageFont.load_default(); draw.text((90,150),'INVOICE 12345 TOTAL 99.50',fill='black',font=font)
+          ib=io.BytesIO(); img.save(ib,format='PNG'); image_bytes=ib.getvalue()
+          out=run('png_ocr','scan.png',image_bytes); ck('png OCR non-empty',len(out.strip())>=10,out[:200]); m['ocrPreview']=out[:200]
+
+          pdf=fitz.open(); p=pdf.new_page(width=595,height=842); p.insert_text((72,120),'NATIVE PDF INVOICE 12345 TOTAL 99.50 '+('X'*60),fontsize=14); native=pdf.tobytes(); pdf.close()
+          out=run('native_pdf','native.pdf',native); ck('native PDF text extraction','NATIVE PDF INVOICE 12345' in out,out[:160])
+
+          pdf=fitz.open(); p=pdf.new_page(width=900,height=350); p.insert_image(p.rect,stream=image_bytes); scan=pdf.tobytes(); pdf.close()
+          out=run('scanned_pdf_ocr','scan.pdf',scan); ck('scanned PDF OCR non-empty',len(out.strip())>=10,out[:200]); m['scannedPdfOcrPreview']=out[:200]
+
+          pdf=fitz.open()
+          for i in range(1,11):
+              p=pdf.new_page(width=595,height=842); p.insert_text((72,120),f'PAGE_{i:02d} UNIQUE_CONTENT_'+('X'*80),fontsize=12)
+          longpdf=pdf.tobytes(); pdf.close(); out=run('long_pdf_10_pages','long.pdf',longpdf)
+          ck('long PDF keeps first 5','PAGE_05' in out); ck('long PDF keeps last 3','PAGE_08' in out and 'PAGE_10' in out); ck('long PDF omits middle','PAGE_06' not in out and 'PAGE_07' not in out)
+
+          valid=Invoice(invoice_number='INV-1',vendor_name='测试有限公司',date='3/8',total_amount=99.5,items=[LineItem(description='A',quantity=1,price=99.5,amount=99.5)])
+          ck('invoice date normalization',valid.date=='2024-3-8',valid.date)
+          rejected=False
+          try: Invoice(invoice_number='INV-2',vendor_name='Bad Vendor',date='2024-03-08',total_amount=1,items=[])
+          except ValidationError: rejected=True
+          ck('invoice vendor validator',rejected)
+
+          og,of,oi,oc=router.get_llm,router.LLMTextCompletionProgram.from_defaults,router.invoice.parse,router.contract.parse
+          try:
+              class F:
+                  def __call__(self,**kwargs): raise RuntimeError('forced classifier failure')
+              router.get_llm=lambda temperature=0.1: object(); router.LLMTextCompletionProgram.from_defaults=lambda *a,**k:F()
+              router.invoice.parse=lambda text:BaseExtractionResult(doc_type='invoice',confidence_score=1.0,data=None,notes='stub')
+              router.contract.parse=lambda text:BaseExtractionResult(doc_type='contract',confidence_score=1.0,data=None,notes='stub')
+              ck('router invoice fallback',router.route_and_extract('这是发票，包含开票信息。').doc_type=='invoice')
+              ck('router contract fallback',router.route_and_extract('本合同由甲方和乙方签订。').doc_type=='contract')
+              ck('router unknown fallback',router.route_and_extract('ordinary unrelated text').doc_type=='unknown')
+          finally: router.get_llm,router.LLMTextCompletionProgram.from_defaults,router.invoice.parse,router.contract.parse=og,of,oi,oc
+
+          ck('redis connectivity',redis.Redis.from_url(os.environ['REDIS_URL']).ping())
+          main=Path('src/main.py').read_text(encoding='utf-8')
+          routes=re.findall(r'@app\.(?:get|post|put|patch|delete)\(\s*["\']([^"\']+)',main)
+          m['apiRouteCount']=len(routes); m['apiRoutes']=routes
+          m['totalChecks']=len(m['checks']); m['passedChecks']=sum(x['passed'] for x in m['checks']); m['failedChecks']=m['totalChecks']-m['passedChecks']; m['success']=m['failedChecks']==0
+          Path('resume-metrics-v2.json').write_text(json.dumps(m,ensure_ascii=False,indent=2),encoding='utf-8'); print(json.dumps(m,ensure_ascii=False,indent=2))
+          PY
+      - name: Upload metrics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: resume-metrics-v2
+          path: resume-metrics-v2.json
+          if-no-files-found: warn
+          retention-days: 7
