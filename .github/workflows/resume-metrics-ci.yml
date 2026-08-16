@@ -1,0 +1,226 @@
+name: Resume Metrics CI
+
+on:
+  push:
+    branches:
+      - resume-metrics-ci
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  component-metrics:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    services:
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Compile source
+        run: python -m compileall -q src
+
+      - name: Run repository component metrics
+        env:
+          REDIS_URL: redis://localhost:6379/0
+        shell: bash
+        run: |
+          python <<'PY'
+          import io
+          import json
+          import os
+          import time
+          from pathlib import Path
+
+          import fitz
+          import docx
+          import redis
+          from PIL import Image, ImageDraw, ImageFont
+          from pydantic import ValidationError
+
+          from src.core.ingest import parse_file
+          from src.core.models import BaseExtractionResult
+          from src.parsers.invoice import Invoice, LineItem
+          import src.router as router
+          from src.main import app
+
+          metrics = {
+              'checks': [],
+              'latencyMs': {},
+          }
+
+          def check(name, condition, detail=None):
+              ok = bool(condition)
+              metrics['checks'].append({'name': name, 'passed': ok, 'detail': detail})
+              if not ok:
+                  raise AssertionError(f'{name} failed: {detail}')
+
+          class MemoryUpload:
+              def __init__(self, filename, payload):
+                  self.filename = filename
+                  self.file = io.BytesIO(payload)
+
+          def timed_parse(label, filename, payload):
+              start = time.perf_counter()
+              out = parse_file(MemoryUpload(filename, payload))
+              elapsed = (time.perf_counter() - start) * 1000
+              metrics['latencyMs'][label] = round(elapsed, 3)
+              return out
+
+          # TXT
+          txt = b'plain text invoice 12345 total 99.50'
+          out = timed_parse('txt', 'sample.txt', txt)
+          check('txt ingestion', 'invoice 12345' in out.lower(), out[:120])
+
+          # Markdown
+          md = b'# Contract\nParty A: Alpha\nParty B: Beta'
+          out = timed_parse('markdown', 'sample.md', md)
+          check('markdown ingestion', 'Party A' in out, out[:120])
+
+          # DOCX
+          d = docx.Document()
+          d.add_paragraph('DOCX CONTRACT PARTY A ALPHA PARTY B BETA')
+          buf = io.BytesIO()
+          d.save(buf)
+          out = timed_parse('docx', 'sample.docx', buf.getvalue())
+          check('docx ingestion', 'DOCX CONTRACT' in out, out[:120])
+
+          # High-resolution synthetic image for RapidOCR.
+          img = Image.new('RGB', (1800, 700), 'white')
+          draw = ImageDraw.Draw(img)
+          font_path = '/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf'
+          font = ImageFont.truetype(font_path, 72) if Path(font_path).exists() else ImageFont.load_default()
+          draw.text((90, 150), 'INVOICE 12345 TOTAL 99.50', fill='black', font=font)
+          img_buf = io.BytesIO()
+          img.save(img_buf, format='PNG')
+          image_bytes = img_buf.getvalue()
+          out = timed_parse('png_ocr', 'scan.png', image_bytes)
+          check('png OCR non-empty', len(out.strip()) >= 10, out[:200])
+          metrics['ocrPreview'] = out[:200]
+
+          # Native-text PDF path.
+          pdf = fitz.open()
+          page = pdf.new_page(width=595, height=842)
+          page.insert_text((72, 120), 'NATIVE PDF INVOICE 12345 TOTAL 99.50', fontsize=20)
+          native_pdf = pdf.tobytes()
+          pdf.close()
+          out = timed_parse('native_pdf', 'native.pdf', native_pdf)
+          check('native PDF text extraction', 'NATIVE PDF INVOICE 12345' in out, out[:160])
+
+          # Scanned PDF path using the same image.
+          pdf = fitz.open()
+          page = pdf.new_page(width=900, height=350)
+          page.insert_image(page.rect, stream=image_bytes)
+          scan_pdf = pdf.tobytes()
+          pdf.close()
+          out = timed_parse('scanned_pdf_ocr', 'scanned.pdf', scan_pdf)
+          check('scanned PDF OCR non-empty', len(out.strip()) >= 10, out[:200])
+          metrics['scannedPdfOcrPreview'] = out[:200]
+
+          # >8 page selection: first five + last three.
+          pdf = fitz.open()
+          for i in range(1, 11):
+              page = pdf.new_page(width=595, height=842)
+              page.insert_text((72, 120), f'PAGE_{i:02d} UNIQUE_CONTENT_' + ('X' * 80), fontsize=12)
+          long_pdf = pdf.tobytes()
+          pdf.close()
+          out = timed_parse('long_pdf_10_pages', 'long.pdf', long_pdf)
+          check('long PDF keeps first 5', 'PAGE_05' in out, None)
+          check('long PDF keeps last 3', 'PAGE_08' in out and 'PAGE_10' in out, None)
+          check('long PDF omits middle pages', 'PAGE_06' not in out and 'PAGE_07' not in out, None)
+
+          # Pydantic schema behavior.
+          valid = Invoice(
+              invoice_number='INV-1',
+              vendor_name='测试有限公司',
+              date='3/8',
+              total_amount=99.5,
+              items=[LineItem(description='A', quantity=1, price=99.5, amount=99.5)],
+          )
+          check('invoice date normalization', valid.date == '2024-3-8', valid.date)
+          rejected = False
+          try:
+              Invoice(
+                  invoice_number='INV-2',
+                  vendor_name='Bad Vendor',
+                  date='2024-03-08',
+                  total_amount=1,
+                  items=[],
+              )
+          except ValidationError:
+              rejected = True
+          check('invoice vendor validator', rejected, None)
+
+          # Route fallback without LM Studio: force classifier failure and stub parsers.
+          original_get_llm = router.get_llm
+          original_factory = router.LLMTextCompletionProgram.from_defaults
+          original_invoice_parse = router.invoice.parse
+          original_contract_parse = router.contract.parse
+          try:
+              class FailingProgram:
+                  def __call__(self, **kwargs):
+                      raise RuntimeError('forced classifier failure')
+
+              router.get_llm = lambda temperature=0.1: object()
+              router.LLMTextCompletionProgram.from_defaults = lambda *a, **k: FailingProgram()
+              router.invoice.parse = lambda text: BaseExtractionResult(
+                  doc_type='invoice', confidence_score=1.0, data=None, notes='stubbed parser')
+              router.contract.parse = lambda text: BaseExtractionResult(
+                  doc_type='contract', confidence_score=1.0, data=None, notes='stubbed parser')
+
+              r1 = router.route_and_extract('这是发票，包含开票信息。')
+              r2 = router.route_and_extract('本合同由甲方和乙方签订。')
+              r3 = router.route_and_extract('ordinary unrelated text')
+              check('router invoice keyword fallback', r1.doc_type == 'invoice', r1.doc_type)
+              check('router contract keyword fallback', r2.doc_type == 'contract', r2.doc_type)
+              check('router unknown fallback', r3.doc_type == 'unknown', r3.doc_type)
+          finally:
+              router.get_llm = original_get_llm
+              router.LLMTextCompletionProgram.from_defaults = original_factory
+              router.invoice.parse = original_invoice_parse
+              router.contract.parse = original_contract_parse
+
+          # Redis service availability and API route inventory.
+          check('redis connectivity', redis.Redis.from_url(os.environ['REDIS_URL']).ping(), None)
+          api_routes = sorted({getattr(route, 'path', '') for route in app.routes if getattr(route, 'path', '')})
+          metrics['apiRouteCount'] = len(api_routes)
+          metrics['apiRoutes'] = api_routes
+
+          metrics['totalChecks'] = len(metrics['checks'])
+          metrics['passedChecks'] = sum(1 for x in metrics['checks'] if x['passed'])
+          metrics['failedChecks'] = metrics['totalChecks'] - metrics['passedChecks']
+          metrics['success'] = metrics['failedChecks'] == 0
+          Path('resume-metrics.json').write_text(json.dumps(metrics, ensure_ascii=False, indent=2), encoding='utf-8')
+          print(json.dumps(metrics, ensure_ascii=False, indent=2))
+          PY
+
+      - name: Upload metrics artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: resume-metrics
+          path: resume-metrics.json
+          if-no-files-found: warn
+          retention-days: 7
